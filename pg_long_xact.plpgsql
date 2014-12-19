@@ -1,0 +1,144 @@
+-- 
+-- Glyn Astill 27/05/2012
+-- Function to schedule in order to log and possibly terminate long running transactions
+--
+
+DROP FUNCTION IF EXISTS public.pg_log_long_xact(interval, boolean, text, interval, interval, boolean);
+CREATE OR REPLACE FUNCTION public.pg_log_long_xact(
+    in_duration interval, -- Report all transactions running longer than this
+    in_report_blockers boolean DEFAULT false, -- Also report detail of the blocking transaction. Default false.
+    in_raise_type text DEFAULT 'notice',  -- Level to use with raise, can be notice/debug/log/info/warning or something else to return as text. Default notice.
+    in_cancel_duration interval DEFAULT null, -- Attempt to cancel the current statement of longest running transaction if running longer than this, starting with blockers. Default don't do anything.
+    in_terminate_duration interval DEFAULT null, -- Attempt to terminate the longest running transaction if running longer than this, starting with blockers. Default don't do anything.
+    in_cancel_all boolean DEFAULT false) -- When false will only attempt to cancel/terminate one at a time, when true will mercilessly cancel/terminate all. Default false.
+RETURNS SETOF text AS
+$BODY$
+DECLARE
+    v_xact record;
+    v_blk_xact record;
+    v_line text;
+    v_cx_attempts integer := 0;
+BEGIN
+    FOR v_xact IN (
+        SELECT procpid AS pid, 
+            usename, 
+            COALESCE(application_name,'[unknown]') as app, 
+            COALESCE(client_addr || ':' || client_port, '[local]') AS client,
+            current_query, 
+            current_timestamp-xact_start AS runtime_int,
+            extract(EPOCH FROM current_timestamp-xact_start) AS runtime,
+            waiting
+        FROM pg_stat_activity 
+        WHERE current_timestamp-xact_start > in_duration
+        AND datname = current_database()
+        ORDER BY waiting ASC, runtime DESC
+    ) LOOP
+        v_line := E'long_xact pid: ' || v_xact.pid || ' duration: ' || v_xact.runtime || ' ms user: ' || v_xact.usename ||
+            ' application: ' || v_xact.app || ' client: ' || v_xact.client ||' statement: ' || v_xact.current_query;
+            
+        CASE lower(in_raise_type)
+            WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
+            WHEN 'debug' THEN RAISE LOG '%', v_line; 
+            WHEN 'log' THEN RAISE LOG '%', v_line; 
+            WHEN 'info' THEN RAISE INFO '%', v_line; 
+            WHEN 'warning' THEN RAISE WARNING '%', v_line; 
+            ELSE RETURN NEXT v_line;
+        END CASE;
+        
+        -- Really better to enable log_lock_waits than use this
+        IF in_report_blockers AND v_xact.waiting THEN
+            SELECT INTO v_blk_xact extract(EPOCH FROM current_timestamp-ba.xact_start) AS blk_runtime,
+                b.pid AS blk_pid,
+                ba.usename AS blk_usename,
+                COALESCE(ba.application_name,'[unknown]') as blk_app,
+                COALESCE(ba.client_addr || ':' || ba.client_port, '[local]') AS blk_client,
+                ba.current_query AS blk_query,
+                COALESCE(t.schemaname || '.' || t.relname || ' (' || b.mode || ')', bt.locks, '[unknown]') AS blk_relation,
+                CASE b.locktype WHEN 'transactionid' THEN 'transaction id ' || b.transactionid ELSE b.locktype END AS blk_type
+            FROM pg_catalog.pg_locks l
+            LEFT JOIN pg_catalog.pg_locks b ON b.granted 
+            AND ((b.locktype = 'transactionid' AND b.transactionid = l.transactionid) OR (b.locktype = 'relation' AND b.relation = l.relation)) 
+            AND b.pid != l.pid
+            LEFT JOIN pg_catalog.pg_stat_activity ba ON ba.procpid = b.pid
+            LEFT JOIN pg_catalog.pg_stat_user_tables t ON l.relation = t.relid
+            LEFT JOIN (SELECT pid, 'any (' || string_agg(schemaname || '.' || relname || ' (' || mode || ')',', ') || ')' AS locks
+             FROM pg_locks JOIN pg_stat_user_tables ON relation = relid 
+             WHERE mode ~ 'ExclusiveLock'
+             GROUP BY pid) bt ON bt.pid = b.pid
+            WHERE l.pid = v_xact.pid AND NOT l.granted LIMIT 1;
+                        
+            IF FOUND THEN
+                v_line := E'long_xact waiter pid: ' || v_xact.pid || ' blocker detail is; pid: ' || v_blk_xact.blk_pid || ' duration: ' ||
+                    v_blk_xact.blk_runtime || ' ms relation: ' || v_blk_xact.blk_relation || ' lock type: ' || v_blk_xact.blk_type ||
+                    ' user: ' || v_blk_xact.blk_usename || ' application: ' || v_blk_xact.blk_app || ' client: ' || 
+                    v_blk_xact.blk_client || ' statement: ' || v_blk_xact.blk_query;
+                    
+                CASE lower(in_raise_type)
+                    WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
+                    WHEN 'debug' THEN RAISE DEBUG '%', v_line; 
+                    WHEN 'log' THEN RAISE LOG '%', v_line; 
+                    WHEN 'info' THEN RAISE INFO '%', v_line; 
+                    WHEN 'warning' THEN RAISE WARNING '%', v_line; 
+                    ELSE RETURN NEXT v_line; 
+                END CASE;
+            END IF;
+        END IF;
+        
+        -- In 9.3+ it's really better to use lock_timeout than use this
+        IF (v_cx_attempts = 0 OR in_cancel_all) AND in_cancel_duration IS NOT NULL AND v_xact.runtime_int > in_cancel_duration THEN
+            v_cx_attempts := v_cx_attempts+1;
+            IF v_xact.current_query <> '<IDLE> in transaction' AND pg_cancel_backend(v_xact.pid) THEN
+                v_line := 'long_xact cancelled backend with pid: ' || v_xact.pid;
+                
+                CASE lower(in_raise_type)
+                    WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
+                    WHEN 'debug' THEN RAISE DEBUG '%', v_line; 
+                    WHEN 'log' THEN RAISE LOG '%', v_line; 
+                    WHEN 'info' THEN RAISE INFO '%', v_line; 
+                    WHEN 'warning' THEN RAISE WARNING '%', v_line; 
+                    ELSE RETURN NEXT v_line; 
+                END CASE;
+            ELSIF in_terminate_duration IS NOT NULL AND v_xact.runtime_int > in_terminate_duration THEN
+                IF pg_terminate_backend(v_xact.pid) THEN
+                    v_line := 'long_xact terminated backend with pid: ' || v_xact.pid;
+                    
+                    CASE lower(in_raise_type)
+                        WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
+                        WHEN 'debug' THEN RAISE DEBUG '%', v_line; 
+                        WHEN 'log' THEN RAISE LOG '%', v_line; 
+                        WHEN 'info' THEN RAISE INFO '%', v_line; 
+                        WHEN 'warning' THEN RAISE WARNING '%', v_line; 
+                        ELSE RETURN NEXT v_line; 
+                    END CASE;            
+                ELSE
+                    v_line := 'long_xact unable to terminate backend with pid: ' || v_xact.pid;
+                    
+                    CASE lower(in_raise_type)
+                        WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
+                        WHEN 'debug' THEN RAISE DEBUG '%', v_line; 
+                        WHEN 'log' THEN RAISE LOG '%', v_line; 
+                        WHEN 'info' THEN RAISE INFO '%', v_line; 
+                        WHEN 'warning' THEN RAISE WARNING '%', v_line; 
+                        ELSE RETURN NEXT v_line; 
+                    END CASE;            
+
+                END IF;
+            ELSE
+                v_line := 'long_xact unable to cancel backend with pid: ' || v_xact.pid;
+                
+                CASE lower(in_raise_type)
+                    WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
+                    WHEN 'debug' THEN RAISE DEBUG '%', v_line; 
+                    WHEN 'log' THEN RAISE LOG '%', v_line; 
+                    WHEN 'info' THEN RAISE INFO '%', v_line; 
+                    WHEN 'warning' THEN RAISE WARNING '%', v_line; 
+                    ELSE RETURN NEXT v_line; 
+                END CASE;
+            END IF;        
+        END IF;
+    END LOOP;
+    
+    RETURN;
+END;
+$BODY$
+LANGUAGE plpgsql VOLATILE;
