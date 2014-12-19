@@ -38,7 +38,7 @@ BEGIN
             
         CASE lower(in_raise_type)
             WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
-            WHEN 'debug' THEN RAISE LOG '%', v_line; 
+            WHEN 'debug' THEN RAISE DEBUG '%', v_line; 
             WHEN 'log' THEN RAISE LOG '%', v_line; 
             WHEN 'info' THEN RAISE INFO '%', v_line; 
             WHEN 'warning' THEN RAISE WARNING '%', v_line; 
