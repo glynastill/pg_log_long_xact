@@ -48,7 +48,7 @@ TEST=# SELECT public.pg_log_long_xact('1s', true, 'text');
 To make it start cancelling statements exceeding a specific duration we pass a duration as the fourth argument; the first transaction exceeding this will be cancelled 
 on each run, with blocking statements prioritised.
 
- (As of pg 9.3 there's a lock_timeout parameter that will abort any statement waiting longer than the specified number of milliseconds, which is much better.  Note that the difference here is that this function will attempt to abort the blocking statement rather than the waiting one.)
+ (As of pg 9.3 there's a lock_timeout parameter that will abort any statement waiting longer than the specified number of milliseconds, which is much better.  Note that the difference here is that this function will attempt to abort the blocking transaction rather than the waiting statement, or if there is no locking just the longest transaction.)
 
 ```sql
 TEST=# SELECT public.pg_log_long_xact('1s', true, 'text', '10 minutes');
