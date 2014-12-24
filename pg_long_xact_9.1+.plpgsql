@@ -18,21 +18,23 @@ DECLARE
     v_blk_xact record;
     v_line text;
     v_cx_attempts integer := 0;
+    v_srv_version numeric;
 BEGIN
-    FOR v_xact IN (
-        SELECT procpid AS pid, 
-            usename, 
-            COALESCE(application_name,'[unknown]') as app, 
-            COALESCE(client_addr || ':' || client_port, '[local]') AS client,
-            current_query, 
-            current_timestamp-xact_start AS runtime_int,
-            extract(EPOCH FROM current_timestamp-xact_start) AS runtime,
-            waiting
-        FROM pg_stat_activity 
-        WHERE current_timestamp-xact_start > in_duration
-        AND datname = current_database()
-        ORDER BY waiting ASC, runtime DESC
-    ) LOOP
+    SELECT substr(setting,1,3)::numeric INTO v_srv_version FROM pg_catalog.pg_settings WHERE name = 'server_version';
+
+    FOR v_xact IN EXECUTE 'SELECT ' || CASE WHEN (v_srv_version < 9.2) THEN 'procpid AS ' ELSE '' END || 'pid, ' ||
+                E'usename, 
+                COALESCE(application_name,\'[unknown]\') as app, 
+                COALESCE(client_addr || \':\' || client_port, \'[local]\') AS client,' ||
+                CASE WHEN (v_srv_version < 9.2) THEN E'current_query, \'[not supported]\' AS state, ' ELSE 'query AS current_query, state, ' END ||
+                E'current_timestamp-xact_start AS runtime_int,
+                extract(EPOCH FROM current_timestamp-xact_start) AS runtime,
+                waiting
+            FROM pg_stat_activity 
+            WHERE current_timestamp-xact_start > \'' || in_duration || E'\'::interval' ||
+            ' AND datname = current_database()
+            ORDER BY waiting ASC, runtime DESC;'
+    LOOP
         v_line := format(E'long_xact pid: %s duration: %s ms user: %s application: %s client: %s statement: %s', 
             v_xact.pid, v_xact.runtime, v_xact.usename, v_xact.app, v_xact.client, v_xact.current_query);        
             
@@ -47,30 +49,53 @@ BEGIN
         
         -- Really better to enable log_lock_waits than use this
         IF in_report_blockers AND v_xact.waiting THEN
-            SELECT INTO v_blk_xact extract(EPOCH FROM current_timestamp-ba.xact_start) AS blk_runtime,
-                b.pid AS blk_pid,
-                ba.usename AS blk_usename,
-                COALESCE(ba.application_name,'[unknown]') as blk_app,
-                COALESCE(ba.client_addr || ':' || ba.client_port, '[local]') AS blk_client,
-                ba.current_query AS blk_query,
-                COALESCE(t.schemaname || '.' || t.relname || ' (' || b.mode || ')', bt.locks, '[unknown]') AS blk_relation,
-                CASE b.locktype WHEN 'transactionid' THEN 'transaction id ' || b.transactionid ELSE b.locktype END AS blk_type
-            FROM pg_catalog.pg_locks l
-            LEFT JOIN pg_catalog.pg_locks b ON b.granted 
-            AND ((b.locktype = 'transactionid' AND b.transactionid = l.transactionid) OR (b.locktype = 'relation' AND b.relation = l.relation)) 
-            AND b.pid != l.pid
-            LEFT JOIN pg_catalog.pg_stat_activity ba ON ba.procpid = b.pid
-            LEFT JOIN pg_catalog.pg_stat_user_tables t ON l.relation = t.relid
-            LEFT JOIN (SELECT pid, 'any (' || string_agg(schemaname || '.' || relname || ' (' || mode || ')',', ') || ')' AS locks
-             FROM pg_locks JOIN pg_stat_user_tables ON relation = relid 
-             WHERE mode ~ 'ExclusiveLock'
-             GROUP BY pid) bt ON bt.pid = b.pid
-            WHERE l.pid = v_xact.pid AND NOT l.granted LIMIT 1;
+            IF (v_srv_version < 9.2) THEN
+                SELECT INTO v_blk_xact extract(EPOCH FROM current_timestamp-ba.xact_start) AS blk_runtime,
+                    b.pid AS blk_pid,
+                    ba.usename AS blk_usename,
+                    COALESCE(ba.application_name,'[unknown]') as blk_app,
+                    COALESCE(ba.client_addr || ':' || ba.client_port, '[local]') AS blk_client,
+                    ba.current_query AS blk_query,
+                    '[not supported]' AS blk_state,
+                    COALESCE(t.schemaname || '.' || t.relname || ' (' || b.mode || ')', bt.locks, '[unknown]') AS blk_relation,
+                    CASE b.locktype WHEN 'transactionid' THEN 'transaction id ' || b.transactionid ELSE b.locktype END AS blk_type
+                FROM pg_catalog.pg_locks l
+                LEFT JOIN pg_catalog.pg_locks b ON b.granted 
+                AND ((b.locktype = 'transactionid' AND b.transactionid = l.transactionid) OR (b.locktype = 'relation' AND b.relation = l.relation)) 
+                AND b.pid != l.pid
+                LEFT JOIN pg_catalog.pg_stat_activity ba ON ba.procpid = b.pid
+                LEFT JOIN pg_catalog.pg_stat_user_tables t ON l.relation = t.relid
+                LEFT JOIN (SELECT pid, 'any (' || string_agg(schemaname || '.' || relname || ' (' || mode || ')',', ') || ')' AS locks
+                FROM pg_locks JOIN pg_stat_user_tables ON relation = relid 
+                WHERE mode ~ 'ExclusiveLock'
+                GROUP BY pid) bt ON bt.pid = b.pid
+                WHERE l.pid = v_xact.pid AND NOT l.granted LIMIT 1;
+            ELSE
+                SELECT INTO v_blk_xact extract(EPOCH FROM current_timestamp-ba.xact_start) AS blk_runtime,
+                    b.pid AS blk_pid,
+                    ba.usename AS blk_usename,
+                    COALESCE(ba.application_name,'[unknown]') as blk_app,
+                    COALESCE(ba.client_addr || ':' || ba.client_port, '[local]') AS blk_client,
+                    ba.query AS blk_query,
+                    ba.state AS blk_state,
+                    COALESCE(t.schemaname || '.' || t.relname || ' (' || b.mode || ')', bt.locks, '[unknown]') AS blk_relation,
+                    CASE b.locktype WHEN 'transactionid' THEN 'transaction id ' || b.transactionid ELSE b.locktype END AS blk_type
+                FROM pg_catalog.pg_locks l
+                LEFT JOIN pg_catalog.pg_locks b ON b.granted 
+                AND ((b.locktype = 'transactionid' AND b.transactionid = l.transactionid) OR (b.locktype = 'relation' AND b.relation = l.relation)) 
+                AND b.pid != l.pid
+                LEFT JOIN pg_catalog.pg_stat_activity ba ON ba.pid = b.pid
+                LEFT JOIN pg_catalog.pg_stat_user_tables t ON l.relation = t.relid
+                LEFT JOIN (SELECT pid, 'any (' || string_agg(schemaname || '.' || relname || ' (' || mode || ')',', ') || ')' AS locks
+                FROM pg_locks JOIN pg_stat_user_tables ON relation = relid 
+                WHERE mode ~ 'ExclusiveLock'
+                GROUP BY pid) bt ON bt.pid = b.pid
+                WHERE l.pid = v_xact.pid AND NOT l.granted LIMIT 1;
+            END IF;
                         
             IF FOUND THEN
-                v_line := format(E'long_xact waiter pid: %s blocker detail is; pid: %s duration: %s ms relation: %s lock type: %s user: %s application: %s client: %s statement: %s', 
-                    v_xact.pid, v_blk_xact.blk_pid, v_blk_xact.blk_runtime, v_blk_xact.blk_relation, v_blk_xact.blk_type, v_blk_xact.blk_usename, v_blk_xact.blk_app, 
-                    v_blk_xact.blk_client, v_blk_xact.blk_query);
+                v_line := format(E'long_xact waiter pid: %s blocker detail is; pid: %s duration: %s ms relation: %s lock type: %s user: %s application: %s client: %s statement: %s',
+                    v_xact.pid, v_blk_xact.blk_pid, v_blk_xact.blk_runtime, v_blk_xact.blk_relation, v_blk_xact.blk_type, v_blk_xact.blk_usename, v_blk_xact.blk_app, v_blk_xact.blk_client, v_blk_xact.blk_query);
                     
                 CASE lower(in_raise_type)
                     WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
@@ -86,7 +111,7 @@ BEGIN
         -- In 9.3+ it's really better to use lock_timeout than use this
         IF (v_cx_attempts = 0 OR in_cancel_all) AND in_cancel_duration IS NOT NULL AND v_xact.runtime_int > in_cancel_duration THEN
             v_cx_attempts := v_cx_attempts+1;
-            IF v_xact.current_query <> '<IDLE> in transaction' AND pg_cancel_backend(v_xact.pid) THEN
+            IF v_xact.current_query <> '<IDLE> in transaction' AND v_xact.state <> 'idle in transaction' AND pg_cancel_backend(v_xact.pid) THEN
                 v_line := format(E'long_xact cancelled backend with pid: %s', v_xact.pid);
 
                 CASE lower(in_raise_type)
