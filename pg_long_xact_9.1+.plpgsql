@@ -28,9 +28,9 @@ BEGIN
                 COALESCE(client_addr || \':\' || client_port, \'[local]\') AS client,' ||
                 CASE WHEN (v_srv_version < 9.2) THEN E'current_query, \'[not supported]\' AS state, ' ELSE 'query AS current_query, state, ' END ||
                 E'current_timestamp-xact_start AS runtime_int,
-                extract(EPOCH FROM current_timestamp-xact_start) AS runtime,
-                waiting
-            FROM pg_stat_activity 
+                extract(EPOCH FROM current_timestamp-xact_start) AS runtime,' ||
+                CASE WHEN (v_srv_version < 9.6) THEN 'waiting, NULL::text AS wait_event, NULL::text AS wait_event_type ' ELSE 'wait_event IS NOT NULL AS waiting, wait_event, wait_event_type ' END ||
+            E'FROM pg_stat_activity 
             WHERE current_timestamp-xact_start > \'' || in_duration || E'\'::interval' ||
             ' AND datname = current_database()
             ORDER BY waiting ASC, runtime DESC;'
@@ -94,8 +94,8 @@ BEGIN
             END IF;
                         
             IF FOUND THEN
-                v_line := format(E'long_xact waiter pid: %s blocker detail is; pid: %s duration: %s ms relation: %s lock type: %s user: %s application: %s client: %s statement: %s',
-                    v_xact.pid, v_blk_xact.blk_pid, v_blk_xact.blk_runtime, v_blk_xact.blk_relation, v_blk_xact.blk_type, v_blk_xact.blk_usename, v_blk_xact.blk_app, v_blk_xact.blk_client, v_blk_xact.blk_query);
+                v_line := format(E'long_xact waiter pid: %s wait type: %s blocker detail is; pid: %s duration: %s ms relation: %s lock type: %s user: %s application: %s client: %s statement: %s',
+                    v_xact.pid, CASE WHEN (v_srv_version < 9.6) THEN '[not supported]' ELSE COALESCE(v_xact.wait_event_type,'N/A')||':'||COALESCE(v_xact.wait_event,'N/A') END, v_blk_xact.blk_pid, v_blk_xact.blk_runtime, v_blk_xact.blk_relation, v_blk_xact.blk_type, v_blk_xact.blk_usename, v_blk_xact.blk_app, v_blk_xact.blk_client, v_blk_xact.blk_query);
                     
                 CASE lower(in_raise_type)
                     WHEN 'notice' THEN RAISE NOTICE '%', v_line; 
